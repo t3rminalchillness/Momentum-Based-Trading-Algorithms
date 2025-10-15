@@ -1,0 +1,451 @@
+---
+title: "Untitled"
+author: "Murgan Govindasamy"
+date: "2025-09-19"
+output: html_document
+---
+
+```{r}
+library(tidyverse)
+library(quantmod)
+library(rugarch)
+setwd("C:/Users/user/Desktop/Project/Trader")
+library(tseries)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(glmnet)
+library(randomForest)
+```
+
+```{r}
+# Get Apple (AAPL) stock data from Yahoo Finance
+getSymbols("AAPL", src = "yahoo", from = "1989-01-01", to = Sys.Date())
+
+# View the latest stock prices
+head(AAPL)
+
+# Get the latest closing price
+last(Cl(AAPL))
+
+price <- Cl(AAPL)
+
+plot(price, type='l')
+```
+```{r}
+library(quantmod)
+
+# Get S&P 500 data from Yahoo Finance
+getSymbols("^GSPC", src = "yahoo", from = "1989-01-01", to = Sys.Date())
+
+# View the first few rows
+head(GSPC)
+
+# Extract closing prices
+price <- Cl(GSPC)
+
+# Get the latest closing price
+last(price)
+
+# Plot the S&P 500 closing prices
+plot(price, type='l', main="S&P 500 Closing Prices", ylab="Price", xlab="Date", col="darkgreen")
+
+```
+
+
+
+```{r}
+drawdown_fn <- function(x) {
+  peak <- cummax(x)
+  dd <- (x - peak) / peak
+  min(dd)   # return the maximum drawdown (most negative) in this window
+}
+
+```
+
+```{r}
+
+df2 <- price
+df2$m30 <- (exp(diff(log(price$AAPL.Close), lag=30)) -1)
+df2$m60 <- (exp(diff(log(price$AAPL.Close), lag=60)) -1)
+df2$m90 <- (exp(diff(log(price$AAPL.Close), lag=90)) -1)
+df2$m120 <- (exp(diff(log(price$AAPL.Close), lag=120)) -1)
+df2$m180 <- (exp(diff(log(price$AAPL.Close), lag=180)) -1)
+df2$m270 <- (exp(diff(log(price$AAPL.Close), lag=270)) -1)
+df2$m300 <- (exp(diff(log(price$AAPL.Close), lag=300)) -1)
+df2$m360 <- (exp(diff(log(price$AAPL.Close), lag=360)) -1)
+data <- na.omit(df2)
+df2 <- as.data.frame(na.omit(df2))
+#df2$AAPL.Close <- 100* df2$AAPL.Close/ df2$AAPL.Close[1]
+df3 <- df2 %>% dplyr::select(-AAPL.Close)
+
+matplot(df3, type='l')
+```
+```{r}
+library(zoo)
+
+d15  <- rollapply(df2$AAPL.Close, width = 15,  FUN = drawdown_fn, align = "right", fill = NA)
+d60  <- rollapply(df2$AAPL.Close, width = 60,  FUN = drawdown_fn, align = "right", fill = NA)
+d90  <- rollapply(df2$AAPL.Close, width = 90,  FUN = drawdown_fn, align = "right", fill = NA)
+d120 <- rollapply(df2$AAPL.Close, width = 120, FUN = drawdown_fn, align = "right", fill = NA)
+
+df_drawdowns <- data.frame(
+  Date = index(data),  # if df2 is a zoo/xts object with dates
+  d15  = d15,
+  d60  = d60,
+  d90  = d90,
+  d120 = d120
+)
+
+df4 <- na.omit(cbind(df2,df_drawdowns))
+```
+
+
+```{r}
+H <- 2
+df4$pi <- exp((252 / H) * log(df4$AAPL.Close / dplyr::lead(df4$AAPL.Close, H))) - 1
+df4 <- na.omit(df4)
+return <- exp(diff(log(df4$AAPL.Close))) - 1
+#df4 <- df4[-1,]
+
+dfx <- df4 %>% select(-AAPL.Close,-Date,-pi)
+dfx <- as.data.frame((dfx))
+dfx2 <- as.data.frame((dfx^2))
+dfx3 <- as.data.frame((dfx^3))
+
+#dfx$return <- return
+
+success <- function(x){
+  if (x <= 0.04){return(0)
+  }else{return(1)}
+  
+}
+y <- (sapply(df4$pi, FUN=success))
+dfx$y <- y
+dfz <- cbind(dfx,dfx2)
+dfz2 <- cbind(dfz,dfx3)
+names(dfz) <- make.names(names(dfz), unique = TRUE)
+names(dfz2) <- make.names(names(dfz2), unique = TRUE)
+#dfx <- dfx %>% dplyr::select(-Date)
+
+#train_idx <- createDataPartition(y, p=0.9, list=FALSE)
+n <- nrow(dfz2) - 252
+train_df <- dfz2[(1:n),]
+test_df <- dfz2[-(1:n),]
+
+```
+
+
+```{r}
+mod2 <- glm(y~., family=binomial(link = "logit"), data=train_df)
+
+# Predicted probabilities of y = 1
+pred_probs <- predict(mod2, type = "response")
+pred_class <- ifelse(pred_probs > 0.457, 1, 0)
+
+cm <- confusionMatrix(as.factor(pred_class), as.factor(train_df$y), positive = "1")
+cm
+
+
+precision <- cm$byClass["Pos Pred Value"]
+recall <- cm$byClass["Sensitivity"]
+
+F1 <- 2 * (precision * recall) / (precision + recall)
+F1
+hist(pred_probs, breaks=30)
+```
+
+
+```{r}
+# Predict on test set
+signal_probs <- predict(mod2, newdata=test_df, type = "response")
+signal <- ifelse(signal_probs > 0.457, 1, 0)
+
+# Extract returns aligned to test set
+returno <- return[(n+1):length(return)]  # test-set returns only
+
+#Signal Shifting
+sig_shifted <- dplyr::lag(signal, 1)
+
+# Strategy return: yesterday's signal * today's return
+strat_return <- returno * sig_shifted[-1]
+
+# Drop NA (first entry has no previous signal)
+strat_return <- na.omit(strat_return)
+returno <- returno[-1]  # drop first to keep lengths same
+
+# Stock cumulative return
+stock_cum <- cumprod(1 + returno)
+
+# Strategy cumulative return
+strat_cum <- cumprod(1 + strat_return)
+
+# --- PLOTS ---
+plot(signal_probs, type='l')
+
+plot(returno, type='l', col='black')
+lines(strat_return, col='red')
+
+plot(stock_cum,
+     type = "l",
+     col = "black",
+     ylim = range(c(stock_cum, strat_cum))
+)
+lines(strat_cum, col = "red")
+
+outperform <- strat_cum / stock_cum - 1
+plot(outperform, type='l')
+hist(signal_probs, breaks=30)
+
+```
+We're gonna try do regularisation
+
+
+```{r}
+X <- as.matrix(train_df %>% select(-y))
+Y <- train_df$y
+
+cv_mod <- cv.glmnet(
+  X, Y,
+  family = "binomial",
+  alpha = 0,      # alpha = 1 → lasso, alpha = 0 → ridge
+  standardize = TRUE
+)
+
+# Best lambda
+best_lambda <- cv_mod$lambda.min
+best_lambda
+
+# Predict probabilities on test set
+X_test <- as.matrix(test_df[,-which(names(test_df) == "y")])
+signal_probs <- predict(cv_mod, newx = X_test, s = 1, type = "response")
+hist(signal_probs, breaks=30)
+```
+
+
+```{r}
+tree_mod <- rpart(y ~ ., data = train_df, method = "class")
+tree_probs <- predict(tree_mod, newdata = train_df, type = "prob")[,2]  
+
+# Turn into signals with threshold
+tree_class <- ifelse(tree_probs > 0.4, 1, 0)
+
+cm <- confusionMatrix(as.factor(tree_class), as.factor(train_df$y), positive = "1")
+cm
+
+
+precision <- cm$byClass["Pos Pred Value"]
+recall <- cm$byClass["Sensitivity"]
+
+F1 <- 2 * (precision * recall) / (precision + recall)
+F1
+```
+```{r}
+mod3 <- glm(y~m60 + m90 + m180 + m270+ m270.1 + m60.2 + m90.2, family=binomial(link = "logit"), data=train_df)
+
+# Predicted probabilities of y = 1
+pred_probs <- predict(mod3, type = "response")
+pred_class <- ifelse(pred_probs > 0.42, 1, 0)
+
+cm <- confusionMatrix(as.factor(pred_class), as.factor(train_df$y), positive = "1")
+cm
+
+
+precision <- cm$byClass["Pos Pred Value"]
+recall <- cm$byClass["Sensitivity"]
+
+F1 <- 2 * (precision * recall) / (precision + recall)
+F1
+```
+```{r}
+signal_probs <- predict(mod3, newdata=test_df, type = "response")
+signal <- ifelse(signal_probs > 0.42, 1, 0)
+returno <- return[-(1:n)]
+
+
+strat_return <- returno*dplyr::lag(signal, 1)
+returnz <- returno[-1]
+strat_return <- na.omit(strat_return)
+
+# Stock cumulative return
+stock_cum <- cumprod(1 + (returnz)) 
+
+# Strategy cumulative return
+strat_cum <- cumprod(1 + (strat_return)) 
+plot(signal_probs, type='l')
+
+plot(returnz, type='l', col='black')
+lines(strat_return,col='red')
+
+plot(stock_cum,
+     type = "l",
+     col = "black",
+     ylim = range(c(stock_cum, strat_cum))  # extend y axis to cover both
+)
+lines(strat_cum, col = "red")
+
+outperform <- strat_cum - stock_cum
+plot(outperform,type='l')
+```
+
+Lets instead use a RandomForest(RF). An RF model might be better in this case, especially for classification because it can capture some non-linear relationships. Given the large number of predictors as well the randomforest might be better as well. 
+```{r}
+train_df$y <- as.factor(train_df$y)
+test_df$y <- as.factor(test_df$y)
+
+rfmod <- randomForest(
+  y ~. ,
+  data= train_df,
+  ntree = 200,
+  mtry = sqrt(ncol(train_df) -1),
+  nodesize=30,
+  importance = TRUE
+)
+
+rf_probs <- predict(rfmod, newdata=train_df, type="prob")[,2]
+hist(rf_probs, breaks=30)
+rf_class <- ifelse(rf_probs >0.5, 1,0)
+
+cm <- confusionMatrix(as.factor(rf_class), as.factor(train_df$y), positive = "1")
+cm
+```
+
+
+```{r}
+rf_probsignal <- predict(rfmod, newdata = test_df, type="prob")[,2]
+hist(rf_probsignal, breaks=100)
+rf_signal <- ifelse(rf_probsignal > 0.48, 1,0)
+
+cm<- confusionMatrix(as.factor(rf_signal), as.factor(test_df$y), positive = "1")
+cm
+
+
+returno <- return[-(1:n)]
+
+
+strat_return <- returno*dplyr::lag(rf_signal, 1)
+returnz <- returno[-1]
+strat_return <- na.omit(strat_return)
+
+# Stock cumulative return
+stock_cum <- cumprod(1 + (returnz)) 
+
+# Strategy cumulative return
+strat_cum <- cumprod(1 + (strat_return)) 
+plot(rf_probsignal, type='l')
+
+plot(returnz, type='l', col='black')
+lines(strat_return,col='red')
+
+plot(stock_cum,
+     type = "l",
+     col = "black",
+     ylim = range(c(stock_cum, strat_cum))  # extend y axis to cover both
+)
+lines(strat_cum, col = "red")
+
+outperform <- strat_cum / stock_cum
+plot(outperform,type='l')
+```
+Lets try using a probability weighted return structure
+
+```{r}
+rf_probsignal <- predict(rfmod, newdata = test_df, type="prob")[,2]
+hist(rf_probsignal, breaks=100)
+
+cm<- confusionMatrix(as.factor(rf_signal), as.factor(test_df$y), positive = "1")
+cm
+
+
+
+position <- scale(rf_probsignal - 0.5) 
+position_lag <- dplyr::lag(position,1)
+
+returno <- return[-(1:n)]
+
+
+strat_return <- returno*position_lag
+returnz <- returno[-1]
+strat_return <- na.omit(strat_return)
+
+# Stock cumulative return
+stock_cum <- cumprod(1 + (returnz)) 
+
+# Strategy cumulative return
+strat_cum <- cumprod(1 + (strat_return)) 
+plot(rf_probsignal, type='l')
+
+plot(returnz, type='l', col='black')
+lines(strat_return,col='red')
+
+plot(stock_cum,
+     type = "l",
+     col = "black",
+     ylim = range(c(stock_cum, strat_cum))  # extend y axis to cover both
+)
+lines(strat_cum, col = "red")
+
+outperform <- strat_cum - stock_cum
+plot(outperform,type='l')
+```
+```{r}
+n <- nrow(dfx) - 252
+train_df <- dfx[(1:n),]
+test_df <- dfx[-(1:n),]
+
+train_df$y <- as.factor(train_df$y)
+test_df$y <- as.factor(test_df$y)
+
+rfmod2 <- randomForest(
+  y ~. ,
+  data= train_df,
+  ntree = 500,
+  mtry = sqrt(ncol(train_df) -1),
+  nodesize=30,
+  importance = TRUE
+)
+
+rf_probs2 <- predict(rfmod2, newdata=train_df, type="prob")[,2]
+hist(rf_probs2, breaks=30)
+rf_class2 <- ifelse(rf_probs >0.5, 1,0)
+
+cm <- confusionMatrix(as.factor(rf_class2), as.factor(train_df$y), positive = "1")
+cm
+```
+```{r}
+rf_probsignal2 <- predict(rfmod2, newdata = test_df, type="prob")[,2]
+hist(rf_probsignal2, breaks=30)
+rf_signal2 <- ifelse(rf_probsignal2 > 0.485, 1,0)
+
+cm<- confusionMatrix(as.factor(rf_signal2), as.factor(test_df$y), positive = "1")
+cm
+
+
+returno <- return[-(1:n)]
+
+
+strat_return <- returno*dplyr::lag(rf_signal2, 1)
+returnz <- returno[-1]
+strat_return <- na.omit(strat_return)
+
+# Stock cumulative return
+stock_cum <- cumprod(1 + (returnz)) 
+
+# Strategy cumulative return
+strat_cum <- cumprod(1 + (strat_return)) 
+plot(rf_probsignal, type='l')
+
+plot(returnz, type='l', col='black')
+lines(strat_return,col='red')
+
+plot(stock_cum,
+     type = "l",
+     col = "black",
+     ylim = range(c(stock_cum, strat_cum))  # extend y axis to cover both
+)
+lines(strat_cum, col = "red")
+
+outperform <- strat_cum / stock_cum
+plot(outperform,type='l')
+```
+
