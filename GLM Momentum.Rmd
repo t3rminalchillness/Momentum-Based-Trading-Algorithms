@@ -1,0 +1,226 @@
+---
+title: "Linear Model Reproduction"
+output: html_document
+date: "2025-10-29"
+---
+
+```{r}
+library(tidyverse)
+library(quantmod)
+library(rugarch)
+library(tseries)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(glmnet)
+library(randomForest)
+library(zoo)
+```
+
+We're going to try build a model losely based off of the one that was built in Beaudan and He (2019). We start off by extracting historical price data of the S&P 500 from Yahoo Finance. We choose to use data from 1989 to present day.
+
+```{r}
+#Getting S&P 500 data from Yahoo Finance
+getSymbols("^GSPC", src = "yahoo", from = "1989-01-01", to = Sys.Date())
+
+
+#Extracting closing prices
+price <- Cl(GSPC)
+
+# Plot the S&P 500 closing prices
+plot(price, type='l', main="S&P 500 Closing Prices", ylab="Price", xlab="Date", col="darkgreen")
+```
+In Beaudan and He, the main features used were momenta and drawdowns over various horizons along with their polynomials. We first find the various momenta, defined as the percentage change between the current index price and some past price at a certain lag. 
+
+```{r}
+df2 <- price
+df2$m30 <- (exp(diff(log(price$GSPC.Close), lag=30)) -1)
+df2$m60 <- (exp(diff(log(price$GSPC.Close), lag=60)) -1)
+df2$m90 <- (exp(diff(log(price$GSPC.Close), lag=90)) -1)
+df2$m120 <- (exp(diff(log(price$GSPC.Close), lag=120)) -1)
+df2$m180 <- (exp(diff(log(price$GSPC.Close), lag=180)) -1)
+df2$m270 <- (exp(diff(log(price$GSPC.Close), lag=270)) -1)
+df2$m300 <- (exp(diff(log(price$GSPC.Close), lag=300)) -1)
+df2$m360 <- (exp(diff(log(price$GSPC.Close), lag=360)) -1)
+data <- na.omit(df2)
+#data <- data %>% dplyr::select(-GSPC.Close)
+df2 <- as.data.frame(na.omit(df2))
+df3 <- df2 %>% dplyr::select(-GSPC.Close)
+
+matplot(
+  x = index(data),                  # use the date index for x-axis
+  y = coredata(df3),               # convert to plain numeric matrix
+  type = "l",
+  lty = 1,
+  col = 1:ncol(data),
+  xlab = "Date",
+  ylab = "Value",
+  main = "Time Series Plot"
+)
+
+legend(
+  "topright",
+  legend = colnames(df3),
+  col = 1:ncol(df3),
+  lty = 1,
+  bty = "n"
+)
+```
+Based on the work done in the paper, the horizons we use for the momenta (the number of lags to go back to find the difference from the current price) are 30,60,90,120,180,270,300, and 360 days. 
+
+We then assign a function to calculate drawdowns, defined as the percentage change between the current index price and the local maximum in some window of time. 
+
+```{r}
+drawdown_fn <- function(x) {
+  peak <- cummax(x)
+  dd <- (x - peak) / peak
+  min(dd)
+}
+```
+
+We now apply this function to the data at 15, 60,90, and 120 day time windows as done in the paper.
+
+```{r}
+d15  <- rollapply(df2$GSPC.Close, width = 15,  FUN = drawdown_fn, align = "right", fill = NA)
+d60  <- rollapply(df2$GSPC.Close, width = 60,  FUN = drawdown_fn, align = "right", fill = NA)
+d90  <- rollapply(df2$GSPC.Close, width = 90,  FUN = drawdown_fn, align = "right", fill = NA)
+d120 <- rollapply(df2$GSPC.Close, width = 120, FUN = drawdown_fn, align = "right", fill = NA)
+
+df_drawdowns <- data.frame(
+  Date = index(data), 
+  d15  = d15,
+  d60  = d60,
+  d90  = d90,
+  d120 = d120
+)
+
+df4 <- na.omit(cbind(df2,df_drawdowns))
+df_drawdowns <- na.omit(df_drawdowns)
+dfx <- df4 %>% dplyr::select(-Date,-GSPC.Close)
+
+matplot(
+  x = df_drawdowns$Date,
+  y = df_drawdowns[, c("d15", "d60", "d90", "d120")],
+  type = "l",
+  lty = 1,
+  col = 1:4,
+  xlab = "Date",
+  ylab = "Drawdown",
+  main = "Rolling Drawdowns"
+)
+
+legend(
+  "bottomleft",
+  legend = c("15-day", "60-day", "90-day", "120-day"),
+  col = 1:4,
+  lty = 1,
+  bty = "n"
+)
+
+```
+We now have the raw features stored in dfx. In accordance with the methodology described in the paper, we produce dataframes containing the polynomails of the features to be included in the model as well. 
+
+
+```{r}
+dfx2 <- as.data.frame(as.matrix(dfx)^2)
+dfx3 <- as.data.frame(as.matrix(dfx)^3)
+
+df_predictors <- cbind(dfx,dfx2,dfx3)
+```
+
+Now that we have our matrix of predictors, we need to produce our vector of responses. As per the paper, our response will be a categorical variable of 2 levels, denoting whether or not on a given day, the annualised profitbality over the next H days exceeds some threshold. For the purpose of this project, we use a H of 3 days, which was the optimal horizon as per the paper, and a profitability threshold of 5%. Naturally, we can expect the last 3 values in the profitability vector to be NA's. We also create a vector of daily returns which will be used to evaluate model performance later on.
+
+```{r}
+H <- 3
+pi <- exp((252 / H) * log(dplyr::lead(df4$GSPC.Close, H) / df4$GSPC.Close)) - 1
+threshold <- 0.05
+y <- ifelse(pi > threshold, 1, 0)
+
+dataset <- na.omit(cbind(df_predictors,y))
+names(dataset) <- make.names(names(dataset), unique = TRUE)
+returns <- exp(diff(log(df2$GSPC.Close))) - 1
+
+```
+
+We now have our complete dataset, containing the predictors and response. We can start fitting our generaised linear model. For that, we first split our data into a test and training set. We also produce a vector of returns for the hold-out period. 
+
+```{r}
+test_length <- 252
+total_length <- nrow(dataset)
+train_length <- total_length - test_length
+
+train_df <- dataset[(1:train_length),]
+test_df <- dataset[((train_length+1):total_length),]
+test_zoo <-  zoo(test_df, order.by = as.Date(rownames(test_df)))
+
+price_returns <- price
+price_returns$returns <- exp(diff(log(price$GSPC.Close))) - 1
+
+test_returns <- price_returns$returns[index(test_zoo)]
+
+```
+We can now train our model on the training set. The model is a generalised linear model with a logit link function, and hence will have probabilities, from 0 to 1 as outputs. We then select a threshold for which if the model prediction is higher, it generates a buy signal. We use a confusion matrix to evaluate the model's performance against the training set, and select a suitable threshold.
+
+```{r}
+model1 <- glm(y~., family=binomial(link = "logit"), data=train_df)
+
+train_probs <- predict(model1, type = "response")
+train_class <- ifelse(train_probs > 0.555, 1, 0)
+
+cm <- confusionMatrix(as.factor(train_class), as.factor(train_df$y), positive = "1")
+cm
+
+
+precision <- cm$byClass["Pos Pred Value"]
+recall <- cm$byClass["Sensitivity"]
+
+F1 <- 2 * (precision * recall) / (precision + recall)
+F1
+hist(train_probs, breaks=30)
+```
+We find that the  model is overly optimistic, owing to the fact that the training period has largely been a period of growth for the index. Hence, we opt to use a threshold that is above 0.5.
+
+```{r}
+test_probs <- predict(model1, newdata=test_df, type='response')
+test_signal <- ifelse(test_probs > 0.5, 1, 0)
+
+model_returns <- test_signal*test_returns
+
+plot(test_returns, type='l', col='black')
+lines(model_returns, col='red')
+
+bnh_performance <- cumprod(test_returns+1)
+model_performance <- cumprod(model_returns+1)
+plot(bnh_performance, type='l',col='black')
+lines(model_performance, col='red')
+
+```
+When applying this model to the test period however, we find that the model's strategy is outperformed by the simple buy and hold case. Adjusting the probability threshold doesn't help, as a threshold too low just leads to the model mimicking a buy and hold approach, and a threshold too high leads to the model's performance just being flat. 
+
+We believe there are a few possible reasons for this. For one, the looking at the histogram of the model's predicted probabilities, we see that the probabilities are largely concentrated from 0.5 to 0.6
+
+```{r}
+
+hist(test_probs, breaks=30)
+```
+This suggests that the model is unsure for most entries what the outcome would be. Essentially, the model's predictions are as good as a coin toss most of the time.
+
+Ultimately, we find that this linear model cannot outperform a buy and hold strategy for a number of reasons. 
+
+1. The training set is much too large and encompasses many different market regimes that are not distinguished in the training set. We could counter this by using a smaller training set, but with the large number of predictors, it would make the model too unstable.
+
+2. There are too many predictors and the signal is just too noisy. 
+
+We do believe that the approach can be improved in 2 key ways.
+
+1. Using a RandomForest model as opposed to a linear model. An RF model, through its ensemble approach allows for accurate predictions and handling many predictors such as the dataset we haave here. Additionally, we would not need the polynomials of the raw momenta and drawdowns in an RF model, as each of the RF decision trees could capture non linear behaviour in the data. 
+
+2. Incorporating different predictors such as interest rates and market volatility to provide better insight to the model on the overall market regimes. We also have to bear in mind that all the predictors used in this model are highly correlated. 
+
+We also believe this linear model is not entirely useless, as the model summary can show us which variables are statistically significant predictors of the index profitaability.
+
+```{r}
+summary(model1)
+```
+
+From this we can see that the most important predictor appears to be the 15 day drawdown. 
